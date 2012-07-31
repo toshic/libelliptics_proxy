@@ -1,0 +1,1 @@
+install(DIRECTORY elliptics DESTINATION include)

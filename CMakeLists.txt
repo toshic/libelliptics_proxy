@@ -24,7 +24,7 @@ set( REQUIRED_LIBRARIES
 		boost_system )
  
 set( CMAKE_CXX_FLAGS "-O0 -Wall -pedantic -std=c++0x" )
- 
+add_subdirectory(include)
 add_library( ${LIB} SHARED ${SOURCES} )
 target_link_libraries( ${LIB} ${REQUIRED_LIBRARIES} )
  
