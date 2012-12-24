@@ -71,6 +71,26 @@ namespace msgpack {
 
         return v;
     }
+
+    inline elliptics::MetabaseGroupWeightsResponse& operator >> (
+            object o,
+            elliptics::MetabaseGroupWeightsResponse& v) {
+        if (o.type != type::MAP) {
+            throw type_error();
+        }
+
+        msgpack::object_kv* p = o.via.map.ptr;
+        msgpack::object_kv* const pend = o.via.map.ptr + o.via.map.size;
+
+        for (; p < pend; ++p) {
+            elliptics::MetabaseGroupWeightsResponse::SizedGroups sized_groups;
+            p->key.convert(&sized_groups.size);
+            p->val.convert(&sized_groups.weighted_groups);
+            v.info.push_back(sized_groups);
+        }
+
+        return v;
+    }
 }
 #endif /* HAVE_METABASE */
 
@@ -106,8 +126,11 @@ EllipticsProxy::EllipticsProxy(const EllipticsProxy::config &c) :
 				eblob_style_path_(c.eblob_style_path)
 #ifdef HAVE_METABASE
 				,cocaine_dealer_(NULL)
+				,metabase_usage_(PROXY_META_OPTIONAL)
 				,metabase_write_addr_(c.metabase_write_addr)
 				,metabase_read_addr_(c.metabase_read_addr)
+				,weight_cache_(get_group_weighs_cache())
+				,group_weights_update_period_(c.group_weights_refresh_period)
 #endif /* HAVE_METABASE */
 {
 	if (!c.remotes.size()) {
@@ -126,7 +149,7 @@ EllipticsProxy::EllipticsProxy(const EllipticsProxy::config &c) :
 		dnet_conf.nsize = c.ns.size();
 	}
 
-	elliptics_log_.reset(new ioremap::elliptics::log_file(c.log_path.c_str(), c.log_mask));
+	elliptics_log_.reset(new ioremap::elliptics::file_logger(c.log_path.c_str(), c.log_mask));
 	elliptics_node_.reset(new ioremap::elliptics::node(*elliptics_log_, dnet_conf));
 
 	for (std::vector<EllipticsProxy::remote>::const_iterator it = c.remotes.begin(); it != c.remotes.end(); ++it) {
@@ -144,9 +167,17 @@ EllipticsProxy::EllipticsProxy(const EllipticsProxy::config &c) :
 	}
 
 	cocaine_default_policy_.timeout = c.wait_timeout;
-	
+	weight_cache_update_thread_ = boost::thread(boost::bind(&EllipticsProxy::collectGroupWeightsLoop, this));
 #endif /* HAVE_METABASE */
 }
+
+#ifdef HAVE_METABASE
+EllipticsProxy::~EllipticsProxy()
+{
+	weight_cache_update_thread_.interrupt();
+	weight_cache_update_thread_.join();
+}
+#endif /* HAVE_METABASE */
 
 std::vector<LookupResult>
 EllipticsProxy::parse_lookup(Key &key, std::string &l)
@@ -208,7 +239,7 @@ LookupResult EllipticsProxy::lookup_impl(Key &key, std::vector<int> &groups)
 
 	lgroups = getGroups(key, groups);
 	try {
-		elliptics_session.add_groups(lgroups);
+		elliptics_session.set_groups(lgroups);
 		std::string l;
 		if (key.byId()) {
 			struct dnet_id id = key.id().dnet_id();
@@ -245,24 +276,19 @@ EllipticsProxy::read_impl(Key &key, uint64_t offset, uint64_t size,
 	std::vector<int> lgroups;
 	lgroups = getGroups(key, groups);
 
+	elliptics_session.set_cflags(cflags);
+	elliptics_session.set_ioflags(ioflags);
+
 	std::string result;
 	ReadResult ret;
 
 	try {
-		elliptics_session.add_groups(lgroups);
+		elliptics_session.set_groups(lgroups);
 
-		if (key.byId()) {
-			dnet_id id = key.id().dnet_id();
-			if (latest)
-				result = elliptics_session.read_latest(id, offset, size, cflags, ioflags);
-			else
-				result = elliptics_session.read_data_wait(id, offset, size, cflags, ioflags);
-		} else {
-			if (latest)
-				result = elliptics_session.read_latest(key.filename(), offset, size, cflags, ioflags, key.column());
-			else
-				result = elliptics_session.read_data_wait(key.filename(), offset, size, cflags, ioflags, key.column());
-		}
+		if (latest)
+			result = elliptics_session.read_latest(key, offset, size);
+		else
+			result = elliptics_session.read_data_wait(key, offset, size);
 
 		if (embeded) {
 			size_t size = result.size();
@@ -324,6 +350,9 @@ std::vector<LookupResult> EllipticsProxy::write_impl(Key &key, std::string &data
 	std::vector<LookupResult> ret;
 	bool use_metabase = false;
 
+	elliptics_session.set_cflags(cflags);
+	elliptics_session.set_ioflags(ioflags);
+
 	if (elliptics_session.state_num() < state_num_) {
 		throw std::runtime_error("Too low number of existing states");
 	}
@@ -336,8 +365,8 @@ std::vector<LookupResult> EllipticsProxy::write_impl(Key &key, std::string &data
 #ifdef HAVE_METABASE
 	if (metabase_usage_ >= PROXY_META_OPTIONAL) {
 		try {
-			std::vector<int> mgroups = get_metabalancer_groups_impl(replication_count, size, key);
 			if (groups.size() != replication_count || metabase_usage_ == PROXY_META_MANDATORY) {
+				std::vector<int> mgroups = get_metabalancer_groups_impl(replication_count, size, key);
 				lgroups = mgroups;
 			}
 			use_metabase = 1;
@@ -351,7 +380,7 @@ std::vector<LookupResult> EllipticsProxy::write_impl(Key &key, std::string &data
 #endif /* HAVE_METABASE */
 
 	try {
-		elliptics_session.add_groups(lgroups);
+		elliptics_session.set_groups(lgroups);
 
 		bool chunked = false;
 		boost::uint64_t chunk_offset = 0;
@@ -390,19 +419,19 @@ std::vector<LookupResult> EllipticsProxy::write_impl(Key &key, std::string &data
 
 		try {
 			if (key.byId()) {
-				lookup = elliptics_session.write_data_wait(id, content, offset, cflags, ioflags);
+				lookup = elliptics_session.write_data_wait(id, content, offset);
 			} else {
 				if (ioflags && DNET_IO_FLAGS_PREPARE) {
-					lookup = elliptics_session.write_prepare(key.filename(), content, offset, size, cflags, ioflags, key.column());
+					lookup = elliptics_session.write_prepare(key, content, offset, size);
 				} else if (ioflags && DNET_IO_FLAGS_COMMIT) {
-					lookup = elliptics_session.write_commit(key.filename(), content, offset, size, cflags, ioflags, key.column());
+					lookup = elliptics_session.write_commit(key, content, offset, size);
 				} else if (ioflags && DNET_IO_FLAGS_PLAIN_WRITE) {
-					lookup = elliptics_session.write_plain(key.filename(), content, offset, cflags, ioflags, key.column());
+					lookup = elliptics_session.write_plain(key, content, offset);
 				} else {
 					if (chunked) {
-						lookup = elliptics_session.write_prepare(key.filename(), content, offset, total_size, cflags, ioflags, key.column());
+						lookup = elliptics_session.write_prepare(key, content, offset, total_size);
 					} else {
-						lookup = elliptics_session.write_data_wait(key.filename(), content, offset, cflags, ioflags, key.column());
+						lookup = elliptics_session.write_data_wait(key, content, offset);
 					}
 				}
 			}
@@ -449,12 +478,12 @@ std::vector<LookupResult> EllipticsProxy::write_impl(Key &key, std::string &data
 			for (std::vector<int>::iterator it = temp_groups.begin(), end = temp_groups.end(); end != it; ++it) {
 				try {
 					try_group[0] = *it;
-					elliptics_session.add_groups(try_group);
+					elliptics_session.set_groups(try_group);
 
 					if (chunked) {
-						lookup = elliptics_session.write_plain(key.filename(), content, offset, cflags, ioflags, key.column());
+						lookup = elliptics_session.write_plain(key, content, offset);
 					} else {
-						lookup = elliptics_session.write_data_wait(key.filename(), content, offset, cflags, ioflags, key.column());
+						lookup = elliptics_session.write_data_wait(key, content, offset);
 					}
 				
 					temp_groups.erase(it);
@@ -467,7 +496,7 @@ std::vector<LookupResult> EllipticsProxy::write_impl(Key &key, std::string &data
 
 		try {
 			if (chunked) {
-				elliptics_session.add_groups(upload_group);
+				elliptics_session.set_groups(upload_group);
 				write_offset = offset + content.size();
 				while (chunk_offset < data.size()) {
 					content.clear();
@@ -475,7 +504,7 @@ std::vector<LookupResult> EllipticsProxy::write_impl(Key &key, std::string &data
 					chunk_offset += chunk_size_;
 					write_offset += content.size();
 
-					lookup = elliptics_session.write_plain(key.filename(), content, write_offset, cflags, ioflags, key.column());
+					lookup = elliptics_session.write_plain(key, content, write_offset);
 				}
 			}
 		} catch(const std::exception &e) {
@@ -492,7 +521,7 @@ std::vector<LookupResult> EllipticsProxy::write_impl(Key &key, std::string &data
 
 		if ((chunked && ret.size() == 0)
 		    || (replication_count != 0 && ret.size() < replication_count)) {
-			elliptics_session.add_groups(upload_group);
+			elliptics_session.set_groups(upload_group);
 			elliptics_session.remove(key.filename());
 			throw std::runtime_error("Not enough copies was written, or problems with chunked upload");
 		}
@@ -503,16 +532,16 @@ std::vector<LookupResult> EllipticsProxy::write_impl(Key &key, std::string &data
 
 		struct timespec ts;
 		memset(&ts, 0, sizeof(ts));
-		elliptics_session.write_metadata(id, key.filename(), upload_group, ts, 0);
+
+		elliptics_session.set_cflags(0);
+		elliptics_session.write_metadata(key, key.filename(), upload_group, ts);
+		elliptics_session.set_cflags(ioflags);
 
 #ifdef HAVE_METABASE
 		if (!metabase_write_addr_.empty() && !metabase_read_addr_.empty()) {
 			uploadMetaInfo(lgroups, key);
 		}
 #endif /* HAVE_METABASE */
-
-		elliptics_session.add_groups(groups_);
-
 	}
 	catch (const std::exception &e) {
 		std::stringstream msg;
@@ -536,6 +565,9 @@ std::vector<std::string> EllipticsProxy::range_get_impl(Key &from, Key &to, uint
 	session elliptics_session(*elliptics_node_);
 	std::vector<int> lgroups;
 	lgroups = getGroups(key, groups);
+
+	elliptics_session.set_cflags(cflags);
+	elliptics_session.set_ioflags(ioflags);
 
 	std::vector<std::string> ret;
 
@@ -561,7 +593,7 @@ std::vector<std::string> EllipticsProxy::range_get_impl(Key &from, Key &to, uint
 
 		for (size_t i = 0; i < lgroups.size(); ++i) {
 			try {
-				ret = elliptics_session.read_data_range(io, lgroups[i], cflags);
+				ret = elliptics_session.read_data_range(io, lgroups[i]);
 				if (ret.size())
 					break;
 			} catch (...) {
@@ -600,7 +632,7 @@ void EllipticsProxy::remove_impl(Key &key, std::vector<int> &groups)
 
 	lgroups = getGroups(key, groups);
 	try {
-		elliptics_session.add_groups(lgroups);
+		elliptics_session.set_groups(lgroups);
 		std::string l;
 		if (key.byId()) {
 			struct dnet_id id = key.id().dnet_id();
@@ -657,7 +689,7 @@ EllipticsProxy::bulk_read_impl(std::vector<Key> &keys, uint64_t cflags, std::vec
 	std::map<ID, Key> keys_transformed;
 
 	try {
-		elliptics_session.add_groups(lgroups);
+		elliptics_session.set_groups(lgroups);
 
                 std::vector<struct dnet_io_attr> ios;
                 ios.reserve(keys.size());
@@ -678,7 +710,7 @@ EllipticsProxy::bulk_read_impl(std::vector<Key> &keys, uint64_t cflags, std::vec
                         keys_transformed.insert(std::make_pair(tmp.id(), *it));
                 }
 
-                result = elliptics_session.bulk_read(ios, cflags);
+		result = elliptics_session.bulk_read(ios);
 
                 for (std::vector<std::string>::iterator it = result.begin();
                                                  it != result.end(); it++) {
@@ -718,6 +750,36 @@ EllipticsProxy::bulk_read_impl(std::vector<Key> &keys, uint64_t cflags, std::vec
 	}
 
 	return ret;
+}
+
+std::vector<EllipticsProxy::remote> EllipticsProxy::lookup_addr_impl(Key &key, std::vector<int> &groups)
+{
+	session elliptics_session(*elliptics_node_);
+	std::vector<int> lgroups = getGroups(key, groups);
+
+    std::vector<EllipticsProxy::remote> addrs;
+
+    for (std::vector<int>::const_iterator it = groups.begin();
+            it != groups.end(); it++)
+    {
+        std::string ret;
+
+        if (key.byId()) {
+            struct dnet_id id = key.id().dnet_id();
+            id.group_id = *it;
+	    ret = elliptics_session.lookup_address(id);
+
+        } else {
+	    ret = elliptics_session.lookup_address(ioremap::elliptics::key(key.filename(), *it));
+        }
+
+        size_t pos = ret.find(':');
+        EllipticsProxy::remote addr(ret.substr(0, pos), boost::lexical_cast<int>(ret.substr(pos+1, std::string::npos)));
+
+        addrs.push_back(addr);
+    }
+
+    return addrs;
 }
 
 /*
@@ -931,7 +993,7 @@ EllipticsProxy::deleteHandler(fastcgi::Request *request) {
 	}
 
 	try {
-		elliptics_node_->add_groups(groups);
+		elliptics_node_->set_groups(groups);
 		if (request->hasArg("id")) {
 			int error = -1;
 			struct dnet_id id;
@@ -957,7 +1019,7 @@ EllipticsProxy::deleteHandler(fastcgi::Request *request) {
 		} else {
 			elliptics_node_->remove(filename);
 		}
-		elliptics_node_->add_groups(groups_);
+		elliptics_node_->set_groups(groups_);
 		request->setStatus(200);
 	}
 	catch (const std::exception &e) {
@@ -1270,7 +1332,7 @@ EllipticsProxy::execScriptHandler(fastcgi::Request *request) {
 	try {
 		log()->debug("script is <%s>", script.c_str());
 
-		elliptics_node_->add_groups(groups);
+		elliptics_node_->set_groups(groups);
 
 		std::string content;
 		request->requestBody().toString(content);
@@ -1282,7 +1344,7 @@ EllipticsProxy::execScriptHandler(fastcgi::Request *request) {
 			ret = elliptics_node_->exec_name(&id, script, "", content, DNET_EXEC_PYTHON_SCRIPT_NAME);
 		}
 
-		elliptics_node_->add_groups(groups_);
+		elliptics_node_->set_groups(groups_);
 
 	}
 	catch (const std::exception &e) {
@@ -1407,34 +1469,87 @@ EllipticsProxy::getMetaInfo(const Key &key) const {
 	}
 }
 
+void EllipticsProxy::collectGroupWeights()
+{
+    if (!cocaine_dealer_.get()) {
+        throw std::runtime_error("Dealer is not initialized");
+    }
+
+    MetabaseGroupWeightsRequest req;
+    MetabaseGroupWeightsResponse resp;
+
+    req.stamp = ++metabase_current_stamp_;
+
+    cocaine::dealer::message_path_t path("mastermind", "get_group_weights");
+
+    boost::shared_ptr<cocaine::dealer::response_t> future;
+    future = cocaine_dealer_->send_message(req, path, cocaine_default_policy_);
+
+    cocaine::dealer::data_container chunk;
+    future->get(&chunk);
+
+    msgpack::unpacked unpacked;
+    msgpack::unpack(&unpacked, static_cast<const char*>(chunk.data()), chunk.size());
+
+    unpacked.get().convert(&resp);
+
+    weight_cache_->update(resp);
+}
+
+void EllipticsProxy::collectGroupWeightsLoop()
+{
+    while(!boost::this_thread::interruption_requested()) {
+        int wait_seconds;
+        try {
+            wait_seconds = 1;
+            collectGroupWeights();
+            elliptics_log_->log(DNET_LOG_INFO, "Updated group weights");
+            wait_seconds = group_weights_update_period_;
+        } catch (const msgpack::unpack_error &e) {
+            std::stringstream msg;
+            msg << "Error while unpacking message: " << e.what();
+            elliptics_log_->log(DNET_LOG_ERROR, msg.str().c_str());
+        } catch (const cocaine::dealer::dealer_error &e) {
+            std::stringstream msg;
+            msg << "Cocaine dealer error: " << e.what();
+            elliptics_log_->log(DNET_LOG_ERROR, msg.str().c_str());
+        } catch (const cocaine::dealer::internal_error &e) {
+            std::stringstream msg;
+            msg << "Cocaine internal error: " << e.what();
+            elliptics_log_->log(DNET_LOG_ERROR, msg.str().c_str());
+        } catch (const std::exception &e) {
+            std::stringstream msg;
+            msg << "Error while updating cache: " << e.what();
+            elliptics_log_->log(DNET_LOG_ERROR, msg.str().c_str());
+        }
+        boost::this_thread::sleep(boost::posix_time::seconds(wait_seconds));
+    }
+
+}
+
 std::vector<int> EllipticsProxy::get_metabalancer_groups_impl(uint64_t count, uint64_t size, Key &key)
 {
-	if (!cocaine_dealer_.get()) {
-		throw std::runtime_error("Dealer is not initialized");
-	}
-
-	struct dnet_id id = key.id().dnet_id();
-
-	MetabaseRequest req;
-	MetabaseResponse resp;
-
-	req.groups_num = count;
-	req.stamp = ++metabase_current_stamp_;
-	req.id.assign(id.id, id.id+DNET_ID_SIZE);
 
 	try {
-		cocaine::dealer::message_path_t path("mastermind", "balance");
+	    std::vector<int> result = weight_cache_->choose(count);
 
-		boost::shared_ptr<cocaine::dealer::response_t> future;
-		future = cocaine_dealer_->send_message(req, path, cocaine_default_policy_);
+	    std::ostringstream msg;
 
-		cocaine::dealer::data_container chunk;
-		future->get(&chunk);
+	    msg << "Chosen group: [";
 
-		msgpack::unpacked unpacked;
-		msgpack::unpack(&unpacked, static_cast<const char*>(chunk.data()), chunk.size());
-
-		unpacked.get().convert(&resp);
+	    std::vector<int>::const_iterator e = result.end();
+	    for(
+	            std::vector<int>::const_iterator it = result.begin();
+	            it != e;
+	            ++it) {
+	        if(it != result.begin()) {
+	            msg << ", ";
+	        }
+	        msg << *it;
+	    }
+	    msg << "]\n";
+	    elliptics_log_->log(DNET_LOG_INFO, msg.str().c_str());
+	    return result;
 
 	} catch (const msgpack::unpack_error &e) {
 		std::stringstream msg;
@@ -1452,9 +1567,6 @@ std::vector<int> EllipticsProxy::get_metabalancer_groups_impl(uint64_t count, ui
 		elliptics_log_->log(DNET_LOG_ERROR, msg.str().c_str());
 		throw;
 	}
-		
-
-	return resp.groups;
 }
 
 GroupInfoResponse EllipticsProxy::get_metabalancer_group_info_impl(int group)
